@@ -1,0 +1,6 @@
+{
+  "name": "session-sync",
+  "version": "0.1.0",
+  "description": "Sync Claude Code conversations to Effective sessions",
+  "author": { "name": "Effective AI Labs" }
+}

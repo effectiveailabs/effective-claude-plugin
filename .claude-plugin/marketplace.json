@@ -1,0 +1,12 @@
+{
+  "name": "effective",
+  "owner": { "name": "Effective AI Labs", "url": "https://effective.ai" },
+  "plugins": [
+    {
+      "name": "session-sync",
+      "source": "./",
+      "description": "Sync Claude Code conversations to Effective sessions",
+      "category": "productivity"
+    }
+  ]
+}
