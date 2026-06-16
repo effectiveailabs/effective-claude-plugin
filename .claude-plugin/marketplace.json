@@ -1,5 +1,10 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "effective",
+  "description": "Effective AI Labs plugins for Claude Code, including conversation sync to Effective sessions",
+  "metadata": {
+    "description": "Effective AI Labs plugins for Claude Code, including conversation sync to Effective sessions"
+  },
   "owner": { "name": "Effective AI Labs", "url": "https://effective.ai" },
   "plugins": [
     {
