@@ -38,11 +38,33 @@ export function paths() {
   };
 }
 
-export function transcriptDir() {
-  const base = process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.trim()
-    ? process.env.CLAUDE_CONFIG_DIR
+// Registry of agent transcript sources. Each source knows its own root dir, how
+// to recognise its transcript files, and how to derive a stable fileId from a
+// file path. State keys are namespaced by source.name so the two never collide.
+export function sources() {
+  const claudeBase = process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.trim()
+    ? process.env.CLAUDE_CONFIG_DIR.trim()
     : path.join(os.homedir(), '.claude');
-  return path.join(base, 'projects');
+  const codexBase = process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
+    ? process.env.CODEX_HOME.trim()
+    : path.join(os.homedir(), '.codex');
+  return [
+    {
+      name: 'claude-code',
+      root: path.join(claudeBase, 'projects'),
+      matches: (f) => f.endsWith('.jsonl'),
+      fileId: (p) => path.basename(p, '.jsonl'),
+    },
+    {
+      name: 'codex',
+      root: path.join(codexBase, 'sessions'),
+      matches: (f) => /^rollout-.*\.jsonl$/.test(path.basename(f)),
+      fileId: (p) => {
+        const m = path.basename(p).match(/([0-9a-fA-F-]{36})\.jsonl$/);
+        return m ? m[1] : path.basename(p, '.jsonl');
+      },
+    },
+  ];
 }
 
 function ensureHome() {
@@ -262,7 +284,7 @@ function deriveTitle(lines, fallback) {
 // Transcript discovery
 // ---------------------------------------------------------------------------
 
-export function findTranscripts(dir) {
+export function findTranscripts(dir, matches = (f) => f.endsWith('.jsonl')) {
   const out = [];
   let entries;
   try {
@@ -274,8 +296,8 @@ export function findTranscripts(dir) {
     const full = path.join(dir, ent.name);
     try {
       if (ent.isDirectory()) {
-        out.push(...findTranscripts(full));
-      } else if (ent.isFile() && ent.name.endsWith('.jsonl')) {
+        out.push(...findTranscripts(full, matches));
+      } else if (ent.isFile() && matches(full)) {
         out.push(full);
       }
     } catch {
@@ -341,9 +363,9 @@ function syncBase(apiBase) {
   return apiBase.replace(/\/+$/, '') + '/api/v1/claude-sync';
 }
 
-export async function postSync(apiBase, token, fileId, metadata, events) {
+export async function postSync(apiBase, token, source, fileId, metadata, events) {
   const url = `${syncBase(apiBase)}/sync`;
-  return requestJson('POST', url, token, { fileId, metadata, events });
+  return requestJson('POST', url, token, { source, fileId, metadata, events });
 }
 
 // ---------------------------------------------------------------------------
@@ -395,10 +417,11 @@ function readDelta(file, offset) {
 // drive a deterministic tick without setInterval.
 // ---------------------------------------------------------------------------
 
-export async function processFile(file, config, state, redactors, log = () => {}) {
-  const fileId = path.basename(file, '.jsonl');
+export async function processFile(file, source, config, state, redactors, log = () => {}) {
+  const fileId = source.fileId(file);
+  const stateKey = `${source.name}:${fileId}`;
   const encodedDir = path.basename(path.dirname(file));
-  const fileState = state.files[fileId] || { offset: 0, lastSeq: 0, cursor: null };
+  const fileState = state.files[stateKey] || { offset: 0, lastSeq: 0, cursor: null };
 
   let stat;
   try {
@@ -414,7 +437,7 @@ export async function processFile(file, config, state, redactors, log = () => {}
   }
 
   if (stat.size <= fileState.offset) {
-    state.files[fileId] = fileState;
+    state.files[stateKey] = fileState;
     return; // nothing new
   }
 
@@ -423,32 +446,35 @@ export async function processFile(file, config, state, redactors, log = () => {}
 
   if (lines.length === 0) {
     // Only a partial trailing line so far — do not advance offset.
-    state.files[fileId] = fileState;
+    state.files[stateKey] = fileState;
     return;
   }
 
-  const { project, cwd } = deriveProjectInfo(encodedDir);
   const redacted = lines.map((l) => redactLine(l, redactors));
 
-  const metadata = {
-    title: deriveTitle(lines, path.basename(cwd) || project),
-    cwd,
-    project,
-    client: 'claude-code',
-  };
+  let metadata = { client: source.name };
+  if (source.name === 'claude-code') {
+    const { project, cwd } = deriveProjectInfo(encodedDir);
+    metadata = {
+      ...metadata,
+      title: deriveTitle(lines, path.basename(cwd) || project),
+      cwd,
+      project,
+    };
+  }
 
   let res;
   try {
-    res = await postSync(config.apiBase, config.token, fileId, metadata, redacted);
+    res = await postSync(config.apiBase, config.token, source.name, fileId, metadata, redacted);
   } catch (err) {
     fileState.lastError = `sync failed: ${err.message}`;
-    state.files[fileId] = fileState;
+    state.files[stateKey] = fileState;
     log(`sync ${fileId} error: ${err.message}`);
     return;
   }
   if (!res || res.status < 200 || res.status >= 300) {
     fileState.lastError = `sync status ${res ? res.status : 'none'}`;
-    state.files[fileId] = fileState;
+    state.files[stateKey] = fileState;
     log(`sync ${fileId} non-2xx: ${res ? res.status : 'none'}`);
     return;
   }
@@ -464,8 +490,8 @@ export async function processFile(file, config, state, redactors, log = () => {}
     fileState.sessionId = res.json.sessionId;
   }
   delete fileState.lastError;
-  state.files[fileId] = fileState;
-  log(`synced ${fileId}: +${appended} events, offset=${fileState.offset}`);
+  state.files[stateKey] = fileState;
+  log(`synced ${stateKey}: +${appended} events, offset=${fileState.offset}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,13 +509,15 @@ export async function tick(log = () => {}) {
 
   const state = readState();
   const redactors = buildRedactors(config);
-  const files = findTranscripts(transcriptDir());
 
-  for (const file of files) {
-    try {
-      await processFile(file, config, state, redactors, log);
-    } catch (err) {
-      log(`processFile ${file} crashed: ${err && err.stack ? err.stack : err}`);
+  for (const source of sources()) {
+    const files = findTranscripts(source.root, source.matches);
+    for (const file of files) {
+      try {
+        await processFile(file, source, config, state, redactors, log);
+      } catch (err) {
+        log(`processFile ${file} crashed: ${err && err.stack ? err.stack : err}`);
+      }
     }
   }
 
@@ -543,12 +571,13 @@ export function runDaemon() {
   };
 
   // fs.watch as a hint only; polling is the source of truth.
-  try {
-    const dir = transcriptDir();
-    fs.mkdirSync(dir, { recursive: true });
-    fs.watch(dir, { recursive: true }, () => { safeTick(); });
-  } catch (err) {
-    log(`fs.watch unavailable (${err.message}); polling only`);
+  for (const source of sources()) {
+    try {
+      fs.mkdirSync(source.root, { recursive: true });
+      fs.watch(source.root, { recursive: true }, () => { safeTick(); });
+    } catch (err) {
+      log(`fs.watch unavailable for ${source.name} (${err.message}); polling only`);
+    }
   }
 
   const interval = setInterval(safeTick, POLL_MS);

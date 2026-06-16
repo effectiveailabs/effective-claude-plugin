@@ -79,6 +79,16 @@ By default, under `$HOME/.config/effective-sync/` (override with the
 
 Transcripts are read from `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`.
 
+## Sources
+
+The daemon watches multiple agent transcript sources and tags each uploaded
+batch with its `source`:
+
+- **Claude Code** — `~/.claude/projects/**/*.jsonl` (override the root with
+  `CLAUDE_CONFIG_DIR`)
+- **OpenAI Codex** — `~/.codex/sessions/**/rollout-*.jsonl` (override the root
+  with `CODEX_HOME`)
+
 ## License
 
 MIT © Effective AI Labs

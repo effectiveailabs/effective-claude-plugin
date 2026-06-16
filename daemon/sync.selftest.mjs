@@ -25,16 +25,27 @@ const sessionDir = path.join(projectsDir, encodedProject);
 const fileId = 'b3f1c0de-0000-4000-8000-000000000001';
 const transcript = path.join(sessionDir, `${fileId}.jsonl`);
 
+// Codex source: rollout files live under ${CODEX_HOME}/sessions/<y>/<m>/<d>/.
+const codexHome = path.join(tmpRoot, 'codex');
+const codexFileId = '019eced6-6dfa-71e1-9334-a3d219c34bb0';
+const codexSessionDir = path.join(codexHome, 'sessions', '2026', '06', '15');
+const codexTranscript = path.join(
+  codexSessionDir,
+  `rollout-2026-06-15T22-10-19-${codexFileId}.jsonl`,
+);
+
 fs.mkdirSync(syncHome, { recursive: true });
 fs.mkdirSync(sessionDir, { recursive: true });
+fs.mkdirSync(codexSessionDir, { recursive: true });
 
 process.env.EFFECTIVE_SYNC_HOME = syncHome;
 process.env.CLAUDE_CONFIG_DIR = claudeHome;
+process.env.CODEX_HOME = codexHome;
 
 // --- mock server ------------------------------------------------------------
 
 const received = {
-  syncCalls: [],  // {fileId, events, body}
+  syncCalls: [],  // {source, fileId, events, body}
   events: [],     // flat list of all accepted event strings
 };
 
@@ -66,8 +77,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && parts[3] === 'sync') {
     const body = await readBody(req);
     const id = body && body.fileId;
+    const source = body && body.source;
     const events = Array.isArray(body.events) ? body.events : [];
-    received.syncCalls.push({ fileId: id, events, body });
+    received.syncCalls.push({ source, fileId: id, events, body });
     for (const e of events) received.events.push(e);
     res.statusCode = 200;
     res.end(JSON.stringify({
@@ -100,7 +112,7 @@ async function run() {
   const port = server.address().port;
   const apiBase = `http://127.0.0.1:${port}`;
 
-  // Import the daemon AFTER env is set so configHome()/transcriptDir() resolve
+  // Import the daemon AFTER env is set so configHome()/sources() resolve
   // to our temp dirs.
   const sync = await import('./sync.mjs');
 
@@ -134,6 +146,9 @@ async function run() {
   assert('a) sync POST used the transcript fileId',
     received.syncCalls[0].fileId === fileId,
     `fileId=${received.syncCalls[0].fileId}`);
+  assert('a) sync POST tagged source=claude-code',
+    received.syncCalls[0].source === 'claude-code',
+    `source=${received.syncCalls[0].source}`);
 
   // Only the 2 complete lines uploaded (NOT the partial).
   const firstBatch = received.syncCalls[0].events;
@@ -158,7 +173,7 @@ async function run() {
 
   // (c) Offset advanced to the byte count of the 2 complete lines only.
   const stateAfter1 = sync.readState();
-  const fs1 = stateAfter1.files[fileId];
+  const fs1 = stateAfter1.files[`claude-code:${fileId}`];
   const expectedOffset = Buffer.byteLength(secretLine + normalLine);
   assert('c) offset advanced to end of complete lines',
     fs1 && fs1.offset === expectedOffset,
@@ -198,7 +213,7 @@ async function run() {
     `total events=${received.events.length}`);
 
   const stateAfter3 = sync.readState();
-  const fs3 = stateAfter3.files[fileId];
+  const fs3 = stateAfter3.files[`claude-code:${fileId}`];
   const finalSize = fs.statSync(transcript).size;
   assert('d) offset now equals full file size (all complete)',
     fs3.offset === finalSize,
@@ -207,6 +222,71 @@ async function run() {
     `sessionId=${fs3.sessionId}`);
   assert('no lastError after successful syncs', !fs3.lastError,
     fs3.lastError || 'clean');
+
+  // --- Phase 4: Codex source — a rollout file under ${CODEX_HOME}/sessions/...
+  console.log('Phase 4: codex rollout source');
+  const codexUserLine = line({
+    timestamp: '2026-06-15T22:10:19.019Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'connect to db with sk-ABCDEFGHIJKLMNOP' }],
+    },
+  });
+  const codexAssistantLine = line({
+    timestamp: '2026-06-15T22:10:20.020Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'sure' }],
+    },
+  });
+  fs.writeFileSync(codexTranscript, codexUserLine + codexAssistantLine);
+
+  const codexCallsBefore = received.syncCalls.length;
+  await sync.tick(() => {});
+
+  const codexCall = received.syncCalls
+    .slice(codexCallsBefore)
+    .find((c) => c.source === 'codex');
+
+  // (a) A codex sync POST arrived with the fileId extracted from the filename.
+  assert('codex) sync POST tagged source=codex', !!codexCall,
+    codexCall ? `source=${codexCall.source}` : 'no codex POST');
+  assert('codex) fileId extracted from rollout filename',
+    codexCall && codexCall.fileId === codexFileId,
+    `fileId=${codexCall ? codexCall.fileId : 'none'} expected=${codexFileId}`);
+  assert('codex) metadata client tagged codex',
+    codexCall && codexCall.body.metadata && codexCall.body.metadata.client === 'codex',
+    `client=${codexCall ? codexCall.body.metadata && codexCall.body.metadata.client : 'none'}`);
+  assert('codex) no claude-only cwd/project leaked into metadata',
+    codexCall && codexCall.body.metadata
+      && codexCall.body.metadata.cwd === undefined
+      && codexCall.body.metadata.project === undefined,
+    'cwd/project omitted');
+
+  // (b) The sk- secret was redacted in the uploaded codex line.
+  const codexJoined = codexCall ? codexCall.events.join('\n') : '';
+  assert('codex) sk- secret redacted to [REDACTED]',
+    !codexJoined.includes('sk-ABCDEFGHIJKLMNOP') && codexJoined.includes('[REDACTED]'),
+    'sk-... removed from codex line');
+  assert('codex) both complete rollout lines uploaded',
+    codexCall && codexCall.events.length === 2,
+    `uploaded ${codexCall ? codexCall.events.length : 0} events (expected 2)`);
+
+  // (c) Offset advanced for the codex file (namespaced state key).
+  const stateAfter4 = sync.readState();
+  const fsCodex = stateAfter4.files[`codex:${codexFileId}`];
+  const codexSize = fs.statSync(codexTranscript).size;
+  assert('codex) offset advanced to full codex file size',
+    fsCodex && fsCodex.offset === codexSize,
+    `offset=${fsCodex ? fsCodex.offset : 'none'} fileSize=${codexSize}`);
+  assert('codex) state key namespaced separately from claude',
+    fsCodex && stateAfter4.files[`claude-code:${fileId}`]
+      && stateAfter4.files[`codex:${codexFileId}`] !== undefined,
+    'claude + codex states coexist');
 
   // --- teardown ---
   server.close();
