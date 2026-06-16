@@ -341,19 +341,9 @@ function syncBase(apiBase) {
   return apiBase.replace(/\/+$/, '') + '/api/v1/claude-sync';
 }
 
-export async function putSession(apiBase, token, fileId, meta) {
-  const url = `${syncBase(apiBase)}/sessions/${encodeURIComponent(fileId)}`;
-  return requestJson('PUT', url, token, meta);
-}
-
-export async function postEvents(apiBase, token, fileId, events) {
-  const url = `${syncBase(apiBase)}/sessions/${encodeURIComponent(fileId)}/events`;
-  return requestJson('POST', url, token, { events });
-}
-
-export async function getCursor(apiBase, token, fileId) {
-  const url = `${syncBase(apiBase)}/sessions/${encodeURIComponent(fileId)}/cursor`;
-  return requestJson('GET', url, token, undefined);
+export async function postSync(apiBase, token, fileId, metadata, events) {
+  const url = `${syncBase(apiBase)}/sync`;
+  return requestJson('POST', url, token, { fileId, metadata, events });
 }
 
 // ---------------------------------------------------------------------------
@@ -440,61 +430,42 @@ export async function processFile(file, config, state, redactors, log = () => {}
   const { project, cwd } = deriveProjectInfo(encodedDir);
   const redacted = lines.map((l) => redactLine(l, redactors));
 
-  // PUT session (idempotent metadata upsert).
-  const meta = {
+  const metadata = {
+    title: deriveTitle(lines, path.basename(cwd) || project),
     cwd,
     project,
-    title: deriveTitle(lines, path.basename(cwd) || project),
-    host: os.hostname(),
     client: 'claude-code',
   };
 
-  let putRes;
+  let res;
   try {
-    putRes = await putSession(config.apiBase, config.token, fileId, meta);
+    res = await postSync(config.apiBase, config.token, fileId, metadata, redacted);
   } catch (err) {
-    fileState.lastError = `PUT failed: ${err.message}`;
+    fileState.lastError = `sync failed: ${err.message}`;
     state.files[fileId] = fileState;
-    log(`PUT ${fileId} error: ${err.message}`);
+    log(`sync ${fileId} error: ${err.message}`);
     return;
   }
-  if (!putRes || putRes.status < 200 || putRes.status >= 300) {
-    fileState.lastError = `PUT status ${putRes ? putRes.status : 'none'}`;
+  if (!res || res.status < 200 || res.status >= 300) {
+    fileState.lastError = `sync status ${res ? res.status : 'none'}`;
     state.files[fileId] = fileState;
-    log(`PUT ${fileId} non-2xx: ${putRes ? putRes.status : 'none'}`);
-    return;
-  }
-  if (putRes.json && putRes.json.effectiveSessionId) {
-    fileState.effectiveSessionId = putRes.json.effectiveSessionId;
-  }
-
-  // POST events.
-  let postRes;
-  try {
-    postRes = await postEvents(config.apiBase, config.token, fileId, redacted);
-  } catch (err) {
-    fileState.lastError = `POST failed: ${err.message}`;
-    state.files[fileId] = fileState;
-    log(`POST ${fileId} error: ${err.message}`);
-    return;
-  }
-  if (!postRes || postRes.status < 200 || postRes.status >= 300) {
-    fileState.lastError = `POST status ${postRes ? postRes.status : 'none'}`;
-    state.files[fileId] = fileState;
-    log(`POST ${fileId} non-2xx: ${postRes ? postRes.status : 'none'}`);
+    log(`sync ${fileId} non-2xx: ${res ? res.status : 'none'}`);
     return;
   }
 
   // Success: advance offset by exactly the consumed (complete-line) bytes.
+  const appended = res.json && typeof res.json.appended === 'number'
+    ? res.json.appended
+    : redacted.length;
   fileState.offset += consumed;
-  fileState.lastSeq = (fileState.lastSeq || 0) + redacted.length;
+  fileState.lastSeq = (fileState.lastSeq || 0) + appended;
   fileState.lastSyncedAt = new Date().toISOString();
-  if (postRes.json && typeof postRes.json.cursor !== 'undefined') {
-    fileState.cursor = postRes.json.cursor;
+  if (res.json && res.json.sessionId) {
+    fileState.sessionId = res.json.sessionId;
   }
   delete fileState.lastError;
   state.files[fileId] = fileState;
-  log(`synced ${fileId}: +${redacted.length} events, offset=${fileState.offset}`);
+  log(`synced ${fileId}: +${appended} events, offset=${fileState.offset}`);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,9 @@
 // daemon/sync.selftest.mjs — end-to-end self-test for the sync daemon.
 //
-// Spins up an in-memory mock of the 3 claude-sync endpoints, points the daemon
-// at it via env, creates a fake transcript, drives ticks directly, and asserts
-// the contract behaviour (PUT-then-POST, redaction, offset advance, delta-only
-// upload, partial-line buffering).
+// Spins up an in-memory mock of the single claude-sync /sync endpoint, points
+// the daemon at it via env, creates a fake transcript, drives ticks directly,
+// and asserts the contract behaviour (single sync POST, redaction, offset
+// advance, delta-only upload, partial-line buffering).
 //
 // Run: node daemon/sync.selftest.mjs
 //
@@ -34,15 +34,9 @@ process.env.CLAUDE_CONFIG_DIR = claudeHome;
 // --- mock server ------------------------------------------------------------
 
 const received = {
-  putCalls: [],   // {fileId, body}
-  postCalls: [],  // {fileId, body}
-  cursorCalls: [],
-  order: [],      // sequence of 'PUT' / 'POST' for ordering assertions
+  syncCalls: [],  // {fileId, events, body}
   events: [],     // flat list of all accepted event strings
 };
-
-let cursor = 0;
-let eventCount = 0;
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -58,10 +52,8 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const parts = url.pathname.split('/').filter(Boolean);
-  // /api/v1/claude-sync/sessions/:fileId[/events|/cursor]
+  // /api/v1/claude-sync/sync
   const auth = req.headers['authorization'] || '';
-  const id = decodeURIComponent(parts[4] || '');
-  const sub = parts[5];
 
   res.setHeader('Content-Type', 'application/json');
 
@@ -71,32 +63,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'PUT' && parts[3] === 'sessions' && !sub) {
+  if (req.method === 'POST' && parts[3] === 'sync') {
     const body = await readBody(req);
-    received.putCalls.push({ fileId: id, body });
-    received.order.push('PUT');
-    res.statusCode = 200;
-    res.end(JSON.stringify({ fileId: id, effectiveSessionId: 'eff_sess_123', cursor }));
-    return;
-  }
-
-  if (req.method === 'POST' && parts[3] === 'sessions' && sub === 'events') {
-    const body = await readBody(req);
+    const id = body && body.fileId;
     const events = Array.isArray(body.events) ? body.events : [];
-    received.postCalls.push({ fileId: id, body });
-    received.order.push('POST');
+    received.syncCalls.push({ fileId: id, events, body });
     for (const e of events) received.events.push(e);
-    eventCount += events.length;
-    cursor += events.length;
     res.statusCode = 200;
-    res.end(JSON.stringify({ accepted: events.length, duplicates: 0, cursor }));
-    return;
-  }
-
-  if (req.method === 'GET' && parts[3] === 'sessions' && sub === 'cursor') {
-    received.cursorCalls.push({ fileId: id });
-    res.statusCode = 200;
-    res.end(JSON.stringify({ fileId: id, cursor, eventCount }));
+    res.end(JSON.stringify({
+      sessionId: `sess-${id}`,
+      appended: events.length,
+      received: events.length,
+    }));
     return;
   }
 
@@ -150,20 +128,15 @@ async function run() {
   console.log('Phase 1: initial sync (2 complete lines + 1 partial)');
   await sync.tick(() => {});
 
-  // (a) PUT then POST.
-  assert('a) mock received a PUT', received.putCalls.length === 1,
-    `putCalls=${received.putCalls.length}`);
-  assert('a) mock received a POST', received.postCalls.length === 1,
-    `postCalls=${received.postCalls.length}`);
-  assert('a) PUT happened before POST',
-    received.order[0] === 'PUT' && received.order[1] === 'POST',
-    `order=${received.order.join(',')}`);
-  assert('a) PUT/POST used the transcript fileId',
-    received.putCalls[0].fileId === fileId && received.postCalls[0].fileId === fileId,
-    `put=${received.putCalls[0].fileId}`);
+  // (a) Single sync POST with the correct fileId.
+  assert('a) mock received a sync POST', received.syncCalls.length === 1,
+    `syncCalls=${received.syncCalls.length}`);
+  assert('a) sync POST used the transcript fileId',
+    received.syncCalls[0].fileId === fileId,
+    `fileId=${received.syncCalls[0].fileId}`);
 
   // Only the 2 complete lines uploaded (NOT the partial).
-  const firstBatch = received.postCalls[0].body.events;
+  const firstBatch = received.syncCalls[0].events;
   assert('e) partial trailing line NOT uploaded', firstBatch.length === 2,
     `uploaded ${firstBatch.length} events (expected 2)`);
 
@@ -176,11 +149,11 @@ async function run() {
     !joined.includes('hunter2') && /password=\[REDACTED\]/.test(joined),
     'hunter2 removed');
 
-  // PUT metadata sanity: cwd reconstructed from encoded dir name.
-  const meta = received.putCalls[0].body;
-  assert('PUT cwd reconstructed from encoded dir', meta.cwd === '/Users/test/git/myrepo',
+  // metadata sanity: cwd reconstructed from encoded dir name.
+  const meta = received.syncCalls[0].body.metadata;
+  assert('sync cwd reconstructed from encoded dir', meta.cwd === '/Users/test/git/myrepo',
     `cwd=${meta.cwd}`);
-  assert('PUT project is the encoded dir name', meta.project === encodedProject,
+  assert('sync project is the encoded dir name', meta.project === encodedProject,
     `project=${meta.project}`);
 
   // (c) Offset advanced to the byte count of the 2 complete lines only.
@@ -195,11 +168,11 @@ async function run() {
 
   // --- Phase 2: tick again with no new complete lines — should upload nothing.
   console.log('Phase 2: re-tick with only the partial line pending');
-  const postsBefore = received.postCalls.length;
+  const postsBefore = received.syncCalls.length;
   await sync.tick(() => {});
   assert('e) re-tick uploads nothing while only partial pending',
-    received.postCalls.length === postsBefore,
-    `posts now=${received.postCalls.length} (was ${postsBefore})`);
+    received.syncCalls.length === postsBefore,
+    `syncCalls now=${received.syncCalls.length} (was ${postsBefore})`);
 
   // --- Phase 3: complete the partial line + add a fresh line; only NEW lines.
   console.log('Phase 3: complete the partial line + append a new line');
@@ -210,7 +183,7 @@ async function run() {
 
   const eventsBefore = received.events.length;
   await sync.tick(() => {});
-  const lastPost = received.postCalls[received.postCalls.length - 1].body.events;
+  const lastPost = received.syncCalls[received.syncCalls.length - 1].events;
 
   assert('d) second tick uploaded only the 2 new lines', lastPost.length === 2,
     `uploaded ${lastPost.length} new events (expected 2)`);
@@ -230,8 +203,8 @@ async function run() {
   assert('d) offset now equals full file size (all complete)',
     fs3.offset === finalSize,
     `offset=${fs3.offset} fileSize=${finalSize}`);
-  assert('d) cursor recorded from server', typeof fs3.cursor === 'number',
-    `cursor=${fs3.cursor}`);
+  assert('d) sessionId recorded from server', fs3.sessionId === `sess-${fileId}`,
+    `sessionId=${fs3.sessionId}`);
   assert('no lastError after successful syncs', !fs3.lastError,
     fs3.lastError || 'clean');
 
