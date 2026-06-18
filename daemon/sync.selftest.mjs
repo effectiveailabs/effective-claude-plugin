@@ -1,6 +1,6 @@
 // daemon/sync.selftest.mjs — end-to-end self-test for the sync daemon.
 //
-// Spins up an in-memory mock of the single claude-sync /sync endpoint, points
+// Spins up an in-memory mock of the single agent-sync /sync endpoint, points
 // the daemon at it via env, creates a fake transcript, drives ticks directly,
 // and asserts the contract behaviour (single sync POST, redaction, offset
 // advance, delta-only upload, partial-line buffering).
@@ -63,7 +63,7 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const parts = url.pathname.split('/').filter(Boolean);
-  // /api/v1/claude-sync/sync
+  // /api/v1/agent-sync/sync
   const auth = req.headers['authorization'] || '';
 
   res.setHeader('Content-Type', 'application/json');

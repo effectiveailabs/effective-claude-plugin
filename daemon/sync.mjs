@@ -360,7 +360,7 @@ function requestJson(method, urlStr, token, bodyObj, timeoutMs = 15000) {
 }
 
 function syncBase(apiBase) {
-  return apiBase.replace(/\/+$/, '') + '/api/v1/claude-sync';
+  return apiBase.replace(/\/+$/, '') + '/api/v1/agent-sync';
 }
 
 export async function postSync(apiBase, token, source, fileId, metadata, events) {
